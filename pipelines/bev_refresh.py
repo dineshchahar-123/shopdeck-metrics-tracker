@@ -1119,12 +1119,13 @@ def main():
     hit2_mom_counts = _C2(x['mon'] for x in hit2_detail)
     hit2_mom = [{'k': m, 'v': hit2_mom_counts[m]} for m in sorted(hit2_mom_counts, key=mon_sort_key)]
 
-    # ---- HIT1 -> HIT2 conversion cohort (1k-5k) : rows = HIT1 month, cols = M0..M5 conversion % ----
+    # ---- HIT1 -> HIT2 conversion cohort (1k-5k) : rows = HIT1 month, cols = M0..M6 conversion % ----
     # Population = sellers on the HITS team OR who reached HIT2 (converters leave the HITS team),
     # grouped by their HIT1 month (hit_month/hit_year). M{age} = HIT2 conversions at (hit2 - hit1) months.
-    H2_TARGET_VEC = {0: 0, 1: 9, 2: 15, 3: 4, 4: 5, 5: 0}   # HIT2 per-age target % (from plan)
+    H2_TARGET_VEC = {0: 0, 1: 9, 2: 15, 3: 4, 4: 5, 5: 5, 6: 5}   # HIT2 per-age target % (dashboard 917 / card 14259)
     GHIT_TARGET_VEC = {0: 10, 1: 10, 2: 10, 3: 10, 4: 5, 5: 0}  # Google-HIT per-age target %
-    H2_MCOLS = ['M0', 'M1', 'M2', 'M3', 'M4', 'M5']
+    H2_MCOLS = ['M0', 'M1', 'M2', 'M3', 'M4', 'M5']   # Google-HIT + golive cohorts still stop at M5
+    HIT2_MCOLS = ['M0', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6']   # HIT1->HIT2 only: dashboard 917 runs to M6
     H2_GRAND_TARGET = sum(H2_TARGET_VEC.values())
     GHIT_GRAND_TARGET = sum(GHIT_TARGET_VEC.values())
     def _ymv(y, m):
@@ -1150,15 +1151,15 @@ def main():
             h2 = _ymv(r.get('hit2_year'), r.get('hit2_month'))
             if h2:
                 age = max(0, (h2 // 100 - h1 // 100) * 12 + (h2 % 100 - h1 % 100))
-                if age < len(H2_MCOLS):
+                if age < len(HIT2_MCOLS):
                     c['cells'][age].append({'s': sid, 'n': nm, 'hit1': '%d-%02d' % (h1 // 100, h1 % 100), 'hit2': '%d-%02d' % (h2 // 100, h2 % 100), 'age': 'M%d' % age})
     MON3b = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
     hit2_cohort_rows = []
     for ym in sorted(h2coh):
         c = h2coh[ym]; n = c['n']
-        maturity = min(len(H2_MCOLS) - 1, (cur_ym // 100 - ym // 100) * 12 + (cur_ym % 100 - ym % 100))
-        cells_pct = {('M%d' % a): (round(len(c['cells'][a]) / n * 100) if n else 0) for a in range(len(H2_MCOLS))}
-        cells_cnt = {('M%d' % a): len(c['cells'][a]) for a in range(len(H2_MCOLS))}
+        maturity = min(len(HIT2_MCOLS) - 1, (cur_ym // 100 - ym // 100) * 12 + (cur_ym % 100 - ym % 100))
+        cells_pct = {('M%d' % a): (round(len(c['cells'][a]) / n * 100) if n else 0) for a in range(len(HIT2_MCOLS))}
+        cells_cnt = {('M%d' % a): len(c['cells'][a]) for a in range(len(HIT2_MCOLS))}
         conv = sum(len(v) for v in c['cells'].values())
         grand = round(conv / n * 100) if n else 0
         tgt = sum(H2_TARGET_VEC.get(a, 0) for a in range(0, maturity + 1))
@@ -1167,10 +1168,10 @@ def main():
             'label': MON3b[ym % 100 - 1] + '-' + str(ym // 100)[2:],
             'n': n, 'cells': cells_pct, 'counts': cells_cnt, 'conv': conv, 'grand': grand,
             'target': tgt, 'delta': grand - tgt, 'maturity': maturity,
-            'detail': {('M%d' % a): c['cells'][a] for a in range(len(H2_MCOLS)) if c['cells'][a]},
+            'detail': {('M%d' % a): c['cells'][a] for a in range(len(HIT2_MCOLS)) if c['cells'][a]},
             'sellers': c['sellers'],
         })
-    hit2_cohort = {'mcols': H2_MCOLS, 'targetVec': {('M%d' % a): H2_TARGET_VEC.get(a, 0) for a in range(len(H2_MCOLS))},
+    hit2_cohort = {'mcols': HIT2_MCOLS, 'targetVec': {('M%d' % a): H2_TARGET_VEC.get(a, 0) for a in range(len(HIT2_MCOLS))},
                    'grandTarget': H2_GRAND_TARGET, 'rows': hit2_cohort_rows}
     print(f"[bev2] HIT1->HIT2 cohort: {len(hit2_cohort_rows)} cohort months")
 

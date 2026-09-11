@@ -11,7 +11,7 @@ tasks & scheduled calls, cases.
 
 Run: cd ~/shopdeck-metrics-site && python3 ~/metabase-arr-refresh/gc_view_refresh.py --push
 """
-import json, os, sys, subprocess, urllib.request, urllib.parse, datetime, re
+import json, os, sys, subprocess, urllib.request, urllib.parse, urllib.error, datetime, re
 from collections import defaultdict
 
 REPO = os.path.expanduser(os.environ.get("REPO_DIR", "~/shopdeck-metrics-site"))
@@ -40,6 +40,8 @@ def creds():
 
 
 def req(url, method="GET", body=None, H=None):
+    """Retry 5xx and timeouts; NEVER retry a 4xx -- a BigQuery quota rejection is a 400 and is
+    permanent until reset. Retrying it turns a hard failure into a very long no-op run."""
     import time as _t
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method, headers=H or {})
@@ -48,10 +50,44 @@ def req(url, method="GET", body=None, H=None):
         try:
             with urllib.request.urlopen(r, timeout=600) as resp:
                 return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                raise
+            last = e
+            _t.sleep(3 * (attempt + 1))
         except Exception as e:
             last = e
             _t.sleep(3 * (attempt + 1))
     raise last
+
+
+# ---- cached-result fallback -------------------------------------------------
+# The api-key path forces a fresh BigQuery scan and is the first thing to fail on a spent
+# daily quota (db 6 and db 23 both run out routinely). A session token returns Metabase's
+# CACHED result for the same card and costs no quota. Configured once by main().
+_AUTH = {}
+_SESS = {}
+
+
+def _sess_hdr():
+    if "h" not in _SESS:
+        tok = req(_AUTH["url"] + "/api/session", "POST",
+                  {"username": _AUTH["email"], "password": _AUTH["pw"]},
+                  {"Content-Type": "application/json"})["id"]
+        _SESS["h"] = {"X-Metabase-Session": tok, "Content-Type": "application/json"}
+        print("[gc] opened a session token for cached-result fallback")
+    return _SESS["h"]
+
+
+def fetch(path, body=None, timeout=600):
+    """POST a Metabase path with the api key, falling back to the cached session result on 4xx."""
+    try:
+        return req(f"{_AUTH['url']}{path}", "POST", body if body is not None else {}, _AUTH["H"])
+    except urllib.error.HTTPError as ex:
+        if not (400 <= ex.code < 500):
+            raise
+        print(f"[gc] {path} -> HTTP {ex.code} on api-key; retrying via cached session result")
+        return req(f"{_AUTH['url']}{path}", "POST", body if body is not None else {}, _sess_hdr())
 
 
 def load_json(name, dflt):
@@ -91,7 +127,7 @@ def try_card(url, cid, H, on_row, label, fallback=None):
             fallback()
         return
     try:
-        for r in req(f"{url}/api/card/{cid}/query/json", "POST", {}, H):
+        for r in fetch(f"/api/card/{cid}/query/json"):
             on_row(r)
         print(f"[gc] card {cid} ok ({label})")
     except Exception as e:
@@ -114,6 +150,9 @@ def main():
         tok = req(url + "/api/session", 'POST', {"username": email, "password": pw}, {'Content-Type': 'application/json'})['id']
         AUTH = {'X-Metabase-Session': tok}
     H = {'Content-Type': 'application/json', **AUTH}
+    _AUTH.update(url=url, email=email, pw=pw, H=H)
+    if 'X-Metabase-Session' in AUTH:      # already on a session token; reuse it as the fallback
+        _SESS['h'] = H
 
     prev = load_json("gc_data.json", {}) or {}
     prev_detail = (load_json("gc_detail_data.json", {}) or {}).get("detail", {})
@@ -124,7 +163,7 @@ def main():
 
     # ---- 7753: GC assignment (growth_consultant_name) + roles ----
     gc_of, roles_of = {}, {}
-    for r in req(f"{url}/api/card/7753/query/json", "POST", {}, H):
+    for r in fetch("/api/card/7753/query/json"):
         sid = str(r.get("seller_id") or "").strip()
         if not sid:
             continue
@@ -146,14 +185,10 @@ def main():
         except (ValueError, TypeError): return None
     people_hist = {}
     try:
-        _clog = req(f"{url}/api/card/10992/query/json", "POST", {}, H)
-    except Exception as _e1:
+        _clog = fetch("/api/card/10992/query/json")
+    except Exception as _e2:
         _clog = []
-        try:  # api-key forces a fresh BQ scan (quota); session returns the cached result
-            _tok = req(url + "/api/session", "POST", {"username": email, "password": pw}, {'Content-Type': 'application/json'})['id']
-            _clog = req(f"{url}/api/card/10992/query/json", "POST", {}, {'X-Metabase-Session': _tok, 'Content-Type': 'application/json'})
-        except Exception as _e2:
-            print("[gc] card 10992 changelog unavailable:", str(_e2)[:80])
+        print("[gc] card 10992 changelog unavailable:", str(_e2)[:80])
     for cr in _clog:
         sid = str(cr.get("seller_id") or "").strip()
         if not sid:

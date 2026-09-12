@@ -1828,12 +1828,23 @@ def main():
     #     age, which lands in no mN bucket while still counting in Grand Total (card 14577 returns
     #     Jul-22 as a row totalling 2 with every bucket 0). GREATEST(..., 0) folds those into M0.
     #
-    # Scoped to cohorts from 2025-01: BOTH spend tables (fb_bid_strategy_spend_daily and
-    # seller_wise_day_wise_arr_frm_jan25) start 2025-01-01, so a cohort handed over before then has
-    # no spend history for its own early months — it reads as silent until Jan-25 and its churn
-    # piles into 12+. Those ages are unmeasurable, not zero. The bound also keeps the day-level
-    # CROSS JOIN off four extra years of BigQuery scan (see the quota note in ONBOARDING §8).
-    CHURN_COHORT_FROM = (2025, 1)
+    # Scoped to cohorts from 2026-02 — the month the HITS book starts. Both populations are then
+    # tracked over the SAME window, so HITS 1k-5k and Revenue are directly comparable rather than
+    # a 7-month book being read against five years of Revenue history.
+    #
+    # It is also the cheap window. The day-level CROSS JOIN is (sellers x days), so this bound cuts
+    # the scan roughly 4x against a 2025-01 floor (1,029 sellers x ~7 months vs 2,029 x ~20) and
+    # ~15x against full history — which matters given the BigQuery quota note in ONBOARDING §8.
+    #
+    # Nothing measurable is lost. Both spend tables (fb_bid_strategy_spend_daily and
+    # seller_wise_day_wise_arr_frm_jan25) start 2025-01-01, so any cohort handed over before then
+    # has no spend history for its own early months: it reads as silent until Jan-25 and its churn
+    # piles into 12+. Those ages were never measurable, only missing.
+    #
+    # Consequence to expect: with a Feb-26 floor the oldest cohort is 7 months old, so M8..M12/12+
+    # stay structurally empty until Feb-27. The columns are kept for when the books mature; the
+    # view leaves an age a cohort has not reached blank rather than showing it as zero.
+    CHURN_COHORT_FROM = (2026, 2)
     HITS_PRED = "(team = 'HITS' OR hit2 = 1) AND good_seller IS NULL"        # card 14576
     REV_PRED  = "team IS NULL AND hit2 IS NULL AND good_seller IS NULL"      # card 14577
     churn_coh = {'maxAge': 12, 'from': '%04d-%02d' % CHURN_COHORT_FROM,

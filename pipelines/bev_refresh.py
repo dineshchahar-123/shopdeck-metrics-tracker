@@ -1813,76 +1813,169 @@ def main():
         sl_history.append({'d': today.isoformat(), 'meta': sl_meta_pct, 'google': sl_google_pct, 'blended': sl_blended_pct})
     print(f"[bev2] spend/live history: {len(sl_history)} points ({sl_history[0]['d'] if sl_history else '-'}..{sl_history[-1]['d'] if sl_history else '-'})")
 
-    # ---- (17) Churn cohort HIT1 / HIT2 / Revenue (card 12159): HIT-week-month cohort x churn age ----
-    # Card 12159 = cohort churn v2. Columns: seller_id, hit_team (HIT1/HIT2/Revenue),
-    # handover_date (first of hit-WEEK month), churn_cohort (M0..M12, M12+ via ROUND(weekgap/4.5)),
-    # churn_flag (1 churned / 0 active). Cohorts Feb-26+; age = round((churn_wk - hit_wk)/4.5).
-    # Rows = HIT month; cohortSize = all sellers handed over that month (both flags);
-    # then M0..M12/12+ = how many of that cohort churned at each age. % view divides by that month's cohort.
-    churn_cmp = {'maxAge': 12,
-                 'rows': {'HIT1': [], 'HIT2': [], 'REVENUE': []},
-                 'cohortSize': {'HIT1': {}, 'HIT2': {}, 'REVENUE': {}},
-                 'totals': {'HIT1': 0, 'HIT2': 0, 'REVENUE': 0}}
+    # ---- (17) Churn cohort HITS 1k-5k / Revenue (cards 14576 / 14577): HIT month x churn age ----
+    # Churn rule (the cards' own CTE chain, kept in sync with 14576/14577 by hand — they differ
+    # only in the eligible_sellers predicate): a seller is churned when weekly Meta+Google spend
+    # stays under Rs 1,000 for >= 3 consecutive FULLY ELAPSED ISO weeks and they have not spent in
+    # any week since. A seller who came back is not churned. Each seller is placed once, at the
+    # month their LATEST such run began, so M0..M12/12+ are non-overlapping and sum to Total churn.
+    #
+    # Two departures from the cards, both deliberate:
+    #  1. The cards publish CUMULATIVE percentages; this view is per-month counts, so the Absolute
+    #     toggle is possible at all. Cumulative is recomputed in the UI for the chart.
+    #  2. The cards compare run_start against DATE_TRUNC(hit month, ISOWEEK). When the handover
+    #     month's first ISO week starts in the previous month a churn run there yields a NEGATIVE
+    #     age, which lands in no mN bucket while still counting in Grand Total (card 14577 returns
+    #     Jul-22 as a row totalling 2 with every bucket 0). GREATEST(..., 0) folds those into M0.
+    #
+    # Scoped to cohorts from 2026-02 — the month the HITS book starts. Both populations are then
+    # tracked over the SAME window, so HITS 1k-5k and Revenue are directly comparable rather than
+    # a 7-month book being read against five years of Revenue history.
+    #
+    # It is also the cheap window. The day-level CROSS JOIN is (sellers x days), so this bound cuts
+    # the scan roughly 4x against a 2025-01 floor (1,029 sellers x ~7 months vs 2,029 x ~20) and
+    # ~15x against full history — which matters given the BigQuery quota note in ONBOARDING §8.
+    #
+    # Nothing measurable is lost. Both spend tables (fb_bid_strategy_spend_daily and
+    # seller_wise_day_wise_arr_frm_jan25) start 2025-01-01, so any cohort handed over before then
+    # has no spend history for its own early months: it reads as silent until Jan-25 and its churn
+    # piles into 12+. Those ages were never measurable, only missing.
+    #
+    # Consequence to expect: with a Feb-26 floor the oldest cohort is 7 months old, so M8..M12/12+
+    # stay structurally empty until Feb-27. The columns are kept for when the books mature; the
+    # view leaves an age a cohort has not reached blank rather than showing it as zero.
+    CHURN_COHORT_FROM = (2026, 2)
+    HITS_PRED = "(team = 'HITS' OR hit2 = 1) AND good_seller IS NULL"        # card 14576
+    REV_PRED  = "team IS NULL AND hit2 IS NULL AND good_seller IS NULL"      # card 14577
+    churn_coh = {'maxAge': 12, 'from': '%04d-%02d' % CHURN_COHORT_FROM,
+                 'spendDataFrom': '2025-01',
+                 'pops': {'HITS': {'label': 'HITS 1k-5k', 'card': '14576', 'cohorts': []},
+                          'REVENUE': {'label': 'Revenue', 'card': '14577', 'cohorts': []}}}
     try:
-        _seg_map = {'HIT1': 'HIT1', 'HIT2': 'HIT2', 'REVENUE': 'REVENUE', 'Revenue': 'REVENUE'}
-        _crows = req(f"{url}/api/card/12159/query/json", 'POST', {}, H)
-        # Card 12159's HIT1 leg is `good_seller IS NULL AND (team='HITS' OR hit2=1)`, so EVERY HIT2
-        # seller is ALSO emitted as HIT1 — HIT1 read 278 instead of 233, with all 45 HIT2 sellers
-        # double-counted. The card's REVENUE leg does exclude hit sellers (`NOT IN hit_sids`), so
-        # mutual exclusivity is plainly the intent and the HIT1 leg just misses it; a churn cohort
-        # must not double-count (see metrics-tracker-data-model). Drop the duplicate HIT1 rows here
-        # so this view is right regardless of the card. Idempotent — a no-op once the card's own SQL
-        # is fixed at source, which is the durable fix.
-        _h2_sids = {str(_r.get('seller_id') or '') for _r in _crows
-                    if str(_r.get('hit_team') or '').strip() == 'HIT2'}
-        _dupes = 0
+        _cut = "(e.hit_year * 12 + e.hit_month) >= %d" % (CHURN_COHORT_FROM[0] * 12 + CHURN_COHORT_FROM[1])
+        _csql = """
+WITH eligible_sellers AS (
+  SELECT seller_id, seller_name, hit_year, hit_month, 'HITS' AS population
+  FROM csv_upload.hit_master_data WHERE __HITS__
+  UNION ALL
+  SELECT seller_id, seller_name, hit_year, hit_month, 'REVENUE' AS population
+  FROM csv_upload.hit_master_data WHERE __REV__
+),
+scoped AS (SELECT * FROM eligible_sellers e WHERE __CUT__),
+date_bounds AS (SELECT MIN(DATE(hit_year, hit_month, 1)) AS min_cohort_date FROM scoped),
+date_cte AS (
+  SELECT d AS calendar_date FROM date_bounds,
+  UNNEST(GENERATE_DATE_ARRAY(min_cohort_date, CURRENT_DATE(), INTERVAL 1 DAY)) AS d
+),
+sellers_distinct AS (SELECT DISTINCT seller_id FROM scoped),
+spend_daily AS (
+  SELECT e.seller_id, d.calendar_date AS date,
+    COALESCE(n.Total_Spend_Meta__c, 0) + COALESCE(a.spend_google, 0) AS total_spend
+  FROM sellers_distinct e CROSS JOIN date_cte d
+  LEFT JOIN `analytics.fb_bid_strategy_spend_daily` n
+    ON n.seller_id = e.seller_id AND n.dated_ist = d.calendar_date
+  LEFT JOIN `analytics.seller_wise_day_wise_arr_frm_jan25` a
+    ON a.seller_id = e.seller_id AND a.date = d.calendar_date
+),
+spend_weekly AS (
+  SELECT seller_id, DATE_TRUNC(date, ISOWEEK) AS week_start, SUM(total_spend) AS weekly_spend
+  FROM spend_daily
+  WHERE DATE_TRUNC(date, ISOWEEK) < DATE_TRUNC(CURRENT_DATE(), ISOWEEK)
+  GROUP BY seller_id, week_start
+),
+flagged AS (
+  SELECT seller_id, week_start, CASE WHEN weekly_spend >= 1000 THEN 1 ELSE 0 END AS has_spend
+  FROM spend_weekly
+),
+ranked AS (
+  SELECT seller_id, week_start, has_spend,
+    ROW_NUMBER() OVER (PARTITION BY seller_id, has_spend ORDER BY week_start) AS rn FROM flagged
+),
+islands AS (
+  SELECT seller_id, week_start, has_spend, DATE_SUB(week_start, INTERVAL rn WEEK) AS grp FROM ranked
+),
+runs AS (
+  SELECT seller_id, has_spend, grp, MIN(week_start) AS run_start,
+    MAX(week_start) AS run_end, COUNT(*) AS run_length
+  FROM islands GROUP BY seller_id, has_spend, grp
+),
+churn_events AS (
+  SELECT seller_id, run_start, run_end FROM runs WHERE has_spend = 0 AND run_length >= 3
+),
+churn_events_valid AS (
+  SELECT DISTINCT ce.seller_id, ce.run_start, ce.run_end FROM churn_events ce
+  WHERE NOT EXISTS (SELECT 1 FROM flagged f
+    WHERE f.seller_id = ce.seller_id AND f.week_start > ce.run_end AND f.has_spend = 1)
+),
+latest_churn_per_seller AS (
+  SELECT seller_id, run_start, run_end,
+    ROW_NUMBER() OVER (PARTITION BY seller_id ORDER BY run_start DESC) AS rn
+  FROM churn_events_valid
+)
+SELECT e.population, e.hit_year, e.hit_month, e.seller_id, e.seller_name,
+  CASE WHEN lc.run_start >= DATE_TRUNC(DATE(e.hit_year, e.hit_month, 1), ISOWEEK)
+       THEN CAST(lc.run_start AS STRING) END AS churn_start,
+  CASE WHEN lc.run_start >= DATE_TRUNC(DATE(e.hit_year, e.hit_month, 1), ISOWEEK)
+       THEN CAST(lc.run_end AS STRING) END AS churn_end,
+  CASE WHEN lc.run_start >= DATE_TRUNC(DATE(e.hit_year, e.hit_month, 1), ISOWEEK)
+       THEN GREATEST(
+         (EXTRACT(YEAR FROM lc.run_start) * 12 + EXTRACT(MONTH FROM lc.run_start))
+         - (e.hit_year * 12 + e.hit_month), 0) END AS months_from_hit
+FROM scoped e
+LEFT JOIN latest_churn_per_seller lc ON lc.seller_id = e.seller_id AND lc.rn = 1
+"""
+        _csql = (_csql.replace('__HITS__', HITS_PRED).replace('__REV__', REV_PRED)
+                      .replace('__CUT__', _cut))
+        _cdq = {'database': 23, 'type': 'native', 'native': {'query': _csql}}
+        _cpay = urllib.parse.urlencode({'query': json.dumps(_cdq)}).encode()
+        _creq = urllib.request.Request(f"{url}/api/dataset/json", data=_cpay, method='POST',
+                                       headers={**AUTH, 'Content-Type': 'application/x-www-form-urlencoded'})
+        _crows = json.loads(urllib.request.urlopen(_creq, timeout=900).read())
+
+        _now_idx = today.year * 12 + today.month
+        _acc = {'HITS': {}, 'REVENUE': {}}
         for _r in _crows:
-            seg = _seg_map.get(str(_r.get('hit_team') or '').strip())
-            if not seg:
-                continue
-            if seg == 'HIT1' and str(_r.get('seller_id') or '') in _h2_sids:
-                _dupes += 1        # HIT2 graduate — counted in its HIT2 cohort month only
-                continue
-            hm = str(_r.get('handover_date') or '')[:7]   # HIT (handover) month YYYY-MM
-            if not hm:
-                continue
-            # cohort base (denominator for the % view) = all eligible sellers of that HIT month
-            churn_cmp['cohortSize'][seg][hm] = churn_cmp['cohortSize'][seg].get(hm, 0) + 1
-            churn_cmp['totals'][seg] += 1
-            if _r.get('churn_flag') != 1:
-                continue
-            _ccoh = str(_r.get('churn_cohort') or '')   # NB: do NOT name this `cohort` — that name
-            if not _ccoh:                              # holds the ARR-cohort dict used by cards.cohort
+            _pop = str(_r.get('population') or '')
+            if _pop not in _acc:
                 continue
             try:
-                age = 13 if _ccoh.endswith('+') else int(_ccoh[1:])   # M12+ -> 13 (renders as 12+)
-            except ValueError:
+                _y, _m = int(_r.get('hit_year')), int(_r.get('hit_month'))
+            except (TypeError, ValueError):
                 continue
-            sid = str(_r.get('seller_id') or '')
-            churn_cmp['rows'][seg].append([sid, None, hm, age, name_by_s.get(sid, '')])
-        # max observed age per segment = age of the oldest cohort in the most-recent CONTIGUOUS run
-        # of hit months (isolated stale cohorts separated by a gap don't stretch the line).
-        _now_idx = today.year * 12 + today.month
-        churn_cmp['maxObs'] = {}
-        for _seg in ('HIT1', 'HIT2', 'REVENUE'):
-            _idxs = sorted({int(h[:4]) * 12 + int(h[5:7]) for h in churn_cmp['cohortSize'][_seg]}, reverse=True)
-            if not _idxs:
-                churn_cmp['maxObs'][_seg] = 0
+            _ym = '%04d-%02d' % (_y, _m)
+            _c = _acc[_pop].setdefault(_ym, {'ym': _ym, 'n': 0, 'counts': [0] * 14, 'total': 0,
+                                             'sellers': {}, 'roster': [], '_seen': set(),
+                                             'maxAge': min(_now_idx - (_y * 12 + _m), 13)})
+            _sid = str(_r.get('seller_id') or '')
+            _nm = str(_r.get('seller_name') or '')
+            # hit_master_data can carry a seller twice in one cohort (name variants); the cohort
+            # base must be DISTINCT sellers or the roster double-lists and n overstates by one.
+            if _sid in _c['_seen']:
                 continue
-            _oldest_run = _idxs[0]
-            for _a, _b in zip(_idxs, _idxs[1:]):
-                if _a - _b == 1:
-                    _oldest_run = _b
-                else:
-                    break
-            churn_cmp['maxObs'][_seg] = min(_now_idx - _oldest_run, churn_cmp['maxAge'] + 1)
-        print(f"[bev2] churn cohort (card 12159): "
-              f"HIT1={len(churn_cmp['rows']['HIT1'])}/{churn_cmp['totals']['HIT1']} "
-              f"HIT2={len(churn_cmp['rows']['HIT2'])}/{churn_cmp['totals']['HIT2']} "
-              f"REVENUE={len(churn_cmp['rows']['REVENUE'])}/{churn_cmp['totals']['REVENUE']} churned/base"
-              f" · dropped {_dupes} HIT2-graduate rows double-counted into HIT1 by the card")
+            _c['_seen'].add(_sid)
+            _c['n'] += 1
+            _c['roster'].append([_sid, _nm])
+            _age = _r.get('months_from_hit')
+            if _age is None:
+                continue
+            _a = min(int(_age), 13)                       # 13 renders as 12+
+            _c['counts'][_a] += 1
+            _c['total'] += 1
+            _c['sellers'].setdefault(str(_a), []).append(
+                [_sid, _nm, str(_r.get('churn_start') or ''), str(_r.get('churn_end') or '')])
+        for _pop in ('HITS', 'REVENUE'):
+            for _ym in sorted(_acc[_pop]):
+                _c = _acc[_pop][_ym]
+                _c['roster'].sort(key=lambda x: (x[1] or '').lower())
+                _c.pop('_seen', None)          # set() is not JSON-serialisable
+                churn_coh['pops'][_pop]['cohorts'].append(_c)
+        print("[bev2] churn cohort (cards 14576/14577, %s+): " % churn_coh['from'] +
+              " · ".join("%s=%d/%d churned over %d cohorts" % (
+                  _p, sum(c['total'] for c in churn_coh['pops'][_p]['cohorts']),
+                  sum(c['n'] for c in churn_coh['pops'][_p]['cohorts']),
+                  len(churn_coh['pops'][_p]['cohorts'])) for _p in ('HITS', 'REVENUE')))
     except Exception as _e:
-        print(f"[bev2] card 12159 churn cohort failed: {_e}")
+        print(f"[bev2] churn cohort (14576/14577) failed: {_e}")
 
     # ---- (18) Platform-level 1k-5k weekly metrics (card 11746): RTO / GMV / cancel / COGS / AOV ... ----
     platform_wk = []
@@ -1937,7 +2030,7 @@ def main():
         'd7Paused': {'value': len(d7_paused), 'detail': d7_paused},
         'nps1k5k': nps_1k5k,
         'arrBuckets1k5k': arr_buckets_1k5k,
-        'churnCmp': churn_cmp,
+        'churnCoh': churn_coh,
         'platformWk': platform_wk,
         'google': {
             'bucketHealth': g_bucket_health, 'potentials': g_potentials, 'objective': g_objective,

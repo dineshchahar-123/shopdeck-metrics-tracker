@@ -44,6 +44,9 @@ jobs:
       - name: Task & Call compliance
         continue-on-error: true
         run: python pipelines/task_refresh.py
+      - name: BAU Metrics (Meta + Google trigger tasks)
+        continue-on-error: true
+        run: python pipelines/bau_refresh.py
       - name: Spend/Live (scaling + google T/S)
         continue-on-error: true
         run: python pipelines/scaling_refresh.py

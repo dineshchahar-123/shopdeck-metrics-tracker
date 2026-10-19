@@ -63,6 +63,14 @@ def req(url, method="GET", body=None, H=None):
                 return json.loads(resp.read().decode())
         except Exception as e:
             last = e
+            # surface the server's reason -- a bare "HTTP Error 400" is undiagnosable
+            body = ""
+            try:
+                body = e.read().decode()[:600]
+            except Exception:
+                pass
+            print(f"[creative-test] attempt {attempt + 1}/4 failed: {e}"
+                  + (f" | {body}" if body else ""), flush=True)
             _t.sleep(3 * (attempt + 1))
     raise last
 
